@@ -1,4 +1,4 @@
-use std::{cell::UnsafeCell, collections::{HashMap, HashSet}, marker::PhantomData, mem::size_of};
+use std::{borrow::BorrowMut, cell::UnsafeCell, collections::{HashMap, HashSet}, ffi::c_void, fmt::Debug, marker::PhantomData, mem::{size_of, MaybeUninit}};
 
 // no error handling, unsafe everywhere. bad code. don't use
 
@@ -17,40 +17,54 @@ macro_rules! global {
     };
 }
 
+macro_rules! erase {
+    ($expr: expr) => {
+        unsafe { std::mem::transmute($expr) }
+    }
+}
+
 global!(LISTENERS: Listeners);
 global!(LISTENER_TAG: usize = 0);
 global!(STORAGE: FakeStorage);
 
-pub type Resolver<T> = fn(x: T) -> T;
 pub type Listener<T> = fn(x: &T) -> ();
 
-pub trait Active<T> {
+pub type Erased = *const c_void;
+pub type Transform<T> = fn(data: Erased) -> T;
+pub type ErasedListener = fn(x: Erased, y: Erased) -> Erased;
+
+pub trait EventTarget {
+    fn addEventListener(&mut self, f: ErasedListener) -> bool;
+    fn removeEventListener(&mut self, f: ErasedListener) -> bool;
+}
+
+pub trait Active<T, Resolved> {
     fn cmp(&self, x: &T) -> bool;
     fn update(&mut self, x: T) -> bool;
     fn listen(&mut self, f: Listener<T>) -> bool;
     fn unlisten(&mut self, f: Listener<T>) -> bool;
-    fn resolve(&self) -> &T;
+    fn resolve(&self) -> &Resolved;
 }
 
-#[derive(Clone, Copy)]
-struct ValueShell<T: Clone + Copy> (T, Option<T>, Resolver<T>, usize);
+impl<T, Resolved> EventTarget for dyn Active<T, Resolved> {
+    fn addEventListener(&mut self, f: ErasedListener) -> bool {
+        self.listen(erase!(f))
+    }
 
-pub struct Value<T: Clone + Copy> {
-    data: T,
-    cache: UnsafeCell<Option<T>>,
-    resolver: Resolver<T>,
-    listener_tag: usize
+    fn removeEventListener(&mut self, f: ErasedListener) -> bool {
+        self.unlisten(erase!(f))
+    }
 }
 
 type Listeners = HashMap<usize, HashSet<Listener<usize>>>;
 
 fn get_listeners<'a, T>(tag: usize) -> &'a HashSet<Listener<T>> {
     // ok listen, i know what you're thinking. i don't give a fuck. void* in Rust
-    unsafe { std::mem::transmute(global!(LISTENERS).get(&tag).unwrap_unchecked()) }
+    erase!(global!(LISTENERS).get(&tag).unwrap_unchecked())
 }
 
 fn get_listeners_mut<'a, T>(tag: usize) -> &'a mut HashSet<Listener<T>> {
-    unsafe { std::mem::transmute(global!(LISTENERS).get_mut(&tag).unwrap_unchecked()) }
+    erase!(global!(LISTENERS).get_mut(&tag).unwrap_unchecked())
 }
 
 fn register_listener_tag() -> usize {
@@ -60,41 +74,51 @@ fn register_listener_tag() -> usize {
     *tag
 }
 
-impl<T: Clone + Copy> Value<T> {
-    unsafe fn get_cache(&self) -> &mut Option<T> {
+#[derive(Clone, Copy)]
+struct ValueShell<T: Clone + Copy, Resolved: Clone + Copy> (T, Option<T>, Transform<Resolved>, usize);
+
+pub struct Value<T: Clone + Copy, Resolved: Clone + Copy> {
+    data: T,
+    cache: UnsafeCell<Option<T>>,
+    resolver: Transform<Resolved>,
+    listener_tag: usize
+}
+
+impl<T: Clone + Copy, Resolved: Clone + Copy> Value<T, Resolved> {
+    fn get_cache(&self) -> &mut Option<Resolved> {
         // i don't even care anymore. unsound interior mutability
-        std::mem::transmute(self.cache.get())
+        erase!(self.cache.get())
     }
 
-    fn update_cache(&self, x: T) {
-        let cache = unsafe { self.get_cache() };
+    fn update_cache(&self, x: Resolved) {
+        let cache = self.get_cache();
         *cache = Some(x);
     }
 
-    fn get_cached(&self) -> Option<&T> {
-        unsafe { self.get_cache().as_ref() }
+    fn get_cached(&self) -> Option<&Resolved> {
+        self.get_cache().as_ref()
     }
 
     pub fn is_cached(&self) -> bool {
-        unsafe { self.get_cache().is_some() }
+        self.get_cache().is_some()
     }
 
     fn dirty(&mut self) {
-        let cache = unsafe { self.get_cache() };
+        let cache = self.get_cache();
         *cache = None;
     }
 
-    pub fn new(x: T, transform: fn (x: T) -> T) -> Self {
+    pub fn new(x: T, transform: fn (x: &T) -> Resolved) -> Self {
         Self {
             data: x,
             cache: UnsafeCell::new(None),
-            resolver: transform,
+            resolver: erase!(transform),
             listener_tag: register_listener_tag()
         }
     }
 }
 
-impl<T: Clone + Copy + PartialEq> Active<T> for Value<T> {
+impl<T: Clone + Copy + PartialEq, Resolved: Clone + Copy> Active<T, Resolved> for Value<T, Resolved> {
     fn cmp(&self, x: &T) -> bool {
         self.data == *x
     }
@@ -117,9 +141,9 @@ impl<T: Clone + Copy + PartialEq> Active<T> for Value<T> {
         get_listeners_mut(self.listener_tag).remove(&f)
     }
 
-    fn resolve(&self) -> &T {
+    fn resolve(&self) -> &Resolved {
         if !self.is_cached() {
-            let new_value = (self.resolver)(self.data);
+            let new_value = (self.resolver)(erase!(&self.data));
             self.update_cache(new_value)
         }
         unsafe { self.get_cached().unwrap_unchecked() }
@@ -134,19 +158,19 @@ struct EvilVec<'a, T> {
 impl<'a, T> EvilVec<'a, T> {
     fn get<Type>(&self, index: usize) -> &'a Type {
         assert!(size_of::<Type>() <= size_of::<T>(), "what the hell dude. i cannot fit that.");
-        unsafe { std::mem::transmute(&self.storage[index * size_of::<T>()]) }
+        erase!(&self.storage[index * size_of::<T>()])
     }
 
     fn get_mut<Type>(&mut self, index: usize) -> &'a mut Type {
         assert!(size_of::<Type>() <= size_of::<T>(), "what the hell dude. i cannot fit that.");
-        unsafe { std::mem::transmute(&mut self.storage[index * size_of::<T>()]) }
+        erase!(&mut self.storage[index * size_of::<T>()])
     }
 
     fn store<Type>(&mut self, value: Type) -> usize {
         assert!(size_of::<Type>() <= size_of::<T>(), "what the hell dude. i cannot fit that.");
         let index = self.storage.len();
         self.storage.resize(index + size_of::<T>(), 0);
-        let slice: &mut Type = unsafe { std::mem::transmute(&mut self.storage[index]) };
+        let slice: &mut Type = erase!(&mut self.storage[index]);
         *slice = value;
         index
     }
@@ -190,23 +214,23 @@ type FakeStorage = Vec<Vec<u8>>;
 
 pub struct Variable<T: Clone + Copy> {
     tag: usize,
-    _phantom_value: PhantomData<Value<T>>
+    _phantom_value: PhantomData<Value<T, T>>
 }
 
 impl<T: Clone + Copy + PartialEq> Variable<T> {
-    fn get_slab<'a>() -> Slab<'a, ValueShell<T>> {
-        Slab::new(&mut global!(STORAGE)[size_of::<Value<T>>()])
+    fn get_slab<'a>() -> Slab<'a, ValueShell<T, T>> {
+        Slab::new(&mut global!(STORAGE)[size_of::<Value<T, T>>()])
     }
 
-    pub fn get<'a>(&self) -> &'a Value<T> {
-        Self::get_slab().get::<Value<T>>(self.tag)
+    pub fn get<'a>(&self) -> &'a Value<T, T> {
+        Self::get_slab().get::<Value<T, T>>(self.tag)
     }
 
-    pub fn get_mut<'a>(&self) -> &'a mut Value<T> {
-        Self::get_slab().get_mut::<Value<T>>(self.tag)
+    pub fn get_mut<'a>(&self) -> &'a mut Value<T, T> {
+        Self::get_slab().get_mut::<Value<T, T>>(self.tag)
     }
 
-    pub fn transformed(value: T, resolver: Resolver<T>) -> Self {
+    pub fn transformed(value: T, resolver: fn (x: &T) -> T) -> Self {
         let tag = Self::get_slab().store(Value::new(value, resolver));
         Self {
             tag: tag,
@@ -215,11 +239,11 @@ impl<T: Clone + Copy + PartialEq> Variable<T> {
     }
 
     pub fn new(value: T) -> Self {
-        Self::transformed(value, |x| x)
+        Self::transformed(value, |x| *x)
     }
 }
 
-impl<T: Clone + Copy + PartialEq> Active<T> for Variable<T> {
+impl<T: Clone + Copy + PartialEq> Active<T, T> for Variable<T> {
     fn cmp(&self, x: &T) -> bool {
         self.get().cmp(x)
     }
@@ -238,6 +262,16 @@ impl<T: Clone + Copy + PartialEq> Active<T> for Variable<T> {
 
     fn resolve(&self) -> &T {
         self.get().resolve()
+    }
+}
+
+impl<T: Clone + Copy + PartialEq> EventTarget for Variable<T> {
+    fn addEventListener(&mut self, f: ErasedListener) -> bool {
+        self.listen(erase!(f))
+    }
+
+    fn removeEventListener(&mut self, f: ErasedListener) -> bool {
+        self.unlisten(erase!(f))
     }
 }
 

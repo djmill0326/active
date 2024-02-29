@@ -1,6 +1,6 @@
 pub mod active;
-use active::{Number, Active};
-use std::fmt::{Display, Debug};
+use active::{Active, Number};
+use std::fmt::{Debug, Display};
 
 fn display<T: Display>(x: &T) {
     println!("{}", x);
