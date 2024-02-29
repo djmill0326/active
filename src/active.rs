@@ -31,7 +31,7 @@ pub type Listener<T> = fn(x: &T) -> ();
 
 pub type Erased = *const c_void;
 pub type Transform<T> = fn(data: Erased) -> T;
-pub type ErasedListener = fn(x: Erased, y: Erased) -> Erased;
+pub type ErasedListener = fn(data: Erased) -> Erased;
 
 pub trait EventTarget {
     fn addEventListener(&mut self, f: ErasedListener) -> bool;
